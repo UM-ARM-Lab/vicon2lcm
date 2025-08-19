@@ -24,6 +24,14 @@ Makefile
 *.exe
 lcm_vicon_bridge
 
+# LCM generated files
+*.c
+*.h
+*.java
+*.class
+*.jar
+vicon_msgs/
+
 # IDE files
 .vscode/
 .idea/

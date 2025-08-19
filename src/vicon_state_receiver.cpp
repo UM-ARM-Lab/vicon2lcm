@@ -1,60 +1,76 @@
 #include <iostream>
 #include <lcm/lcm.h>
-#include <unistd.h>
-
 #include "../vicon_msgs/vicon_state_t.hpp"
+#include "../vicon_msgs/vicon_twist_t.hpp"
+
+// Define M_PI if not defined
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 void handle_vicon_state(const lcm_recv_buf_t* rbuf, const char* channel, void* user) {
-    vicon_msgs::vicon_state_t state;
-    state.decode(rbuf->data, 0, rbuf->data_size);
+    vicon_msgs::vicon_state_t msg;
+    int result = msg.decode(rbuf->data, 0, rbuf->data_size);
     
-               std::cout << "Received vicon_state_t on channel: " << channel << std::endl;
-           std::cout << "  Timestamp: " << state.utime << " us" << std::endl;
-           std::cout << "  Tracker: " << state.tracker_name << std::endl;
-           std::cout << "  Frame ID: " << state.frame_id << std::endl;
-           std::cout << "  Bodies: " << state.num_bodies << std::endl;
-    std::cout << "---" << std::endl;
-    
-    // Print details for each tracked body
-    for (int i = 0; i < state.num_bodies; i++) {
-        std::cout << "  Body " << i << ": " << state.body_names[i] << std::endl;
-        std::cout << "    Position: [" << state.positions[i][0] << ", " << state.positions[i][1] 
-                  << ", " << state.positions[i][2] << "] m" << std::endl;
-                       std::cout << "    Quaternion (wxyz): [" << state.quaternions[i][0] << ", " << state.quaternions[i][1]
-                         << ", " << state.quaternions[i][2] << ", " << state.quaternions[i][3] << "]" << std::endl;
-               std::cout << "    RPY: [" << state.rpy[i][0] << ", " << state.rpy[i][1]
-                         << ", " << state.rpy[i][2] << "] rad" << std::endl;
-               std::cout << "    Occluded: " << (state.occluded[i] ? "YES" : "NO") << std::endl;
-        std::cout << "  ---" << std::endl;
+    if (result < 0) {
+        std::cout << "Error decoding vicon state message" << std::endl;
+        return;
     }
-    std::cout << "==================" << std::endl;
+    
+    std::cout << "\n=== VICON STATE ===" << std::endl;
+    std::cout << "Channel: " << channel << std::endl;
+    std::cout << "Timestamp: " << msg.utime << " us" << std::endl;
+    std::cout << "Tracker: " << msg.tracker_name << std::endl;
+    std::cout << "Frame ID: " << msg.frame_id << std::endl;
+    std::cout << "Number of bodies: " << msg.num_bodies << std::endl;
+    
+    for (int i = 0; i < msg.num_bodies; i++) {
+        std::cout << "  Body " << i << ": " << msg.body_names[i] << std::endl;
+        std::cout << "    Position: [" << msg.positions[i][0] << ", " << msg.positions[i][1] << ", " << msg.positions[i][2] << "] m" << std::endl;
+        std::cout << "    Quaternion: [" << msg.quaternions[i][0] << ", " << msg.quaternions[i][1] << ", " << msg.quaternions[i][2] << ", " << msg.quaternions[i][3] << "]" << std::endl;
+        std::cout << "    RPY: [" << msg.rpy[i][0] * 180.0 / M_PI << "°, " << msg.rpy[i][1] * 180.0 / M_PI << "°, " << msg.rpy[i][2] * 180.0 / M_PI << "°]" << std::endl;
+        std::cout << "    Occluded: " << (msg.occluded[i] ? "YES" : "NO") << std::endl;
+    }
 }
 
-int main(int argc, char** argv) {
-    std::string channel = "VICON_STATE";
+void handle_vicon_twist(const lcm_recv_buf_t* rbuf, const char* channel, void* user) {
+    vicon_msgs::vicon_twist_t msg;
+    int result = msg.decode(rbuf->data, 0, rbuf->data_size);
     
-    if (argc > 1) {
-        channel = argv[1];
+    if (result < 0) {
+        std::cout << "Error decoding vicon twist message" << std::endl;
+        return;
     }
     
-    std::cout << "Starting Vicon State Receiver..." << std::endl;
-    std::cout << "Listening on channel: " << channel << std::endl;
-    std::cout << "Press Ctrl+C to stop" << std::endl;
-    std::cout << "==================" << std::endl;
+    std::cout << "\n=== VICON TWIST ===" << std::endl;
+    std::cout << "Channel: " << channel << std::endl;
+    std::cout << "Timestamp: " << msg.utime << " us" << std::endl;
+    std::cout << "Tracker: " << msg.tracker_name << std::endl;
+    std::cout << "Frame ID: " << msg.frame_id << std::endl;
+    std::cout << "Number of bodies: " << msg.num_bodies << std::endl;
     
-    lcm_t *lcm = lcm_create(NULL);
+    for (int i = 0; i < msg.num_bodies; i++) {
+        std::cout << "  Body " << i << ": " << msg.body_names[i] << std::endl;
+        std::cout << "    Linear velocity: [" << msg.vx[i] << ", " << msg.vy[i] << ", " << msg.vz[i] << "] m/s" << std::endl;
+        std::cout << "    Angular velocity: [" << msg.wx[i] << ", " << msg.wy[i] << ", " << msg.wz[i] << "] rad/s" << std::endl;
+    }
+}
+
+int main() {
+    lcm_t* lcm = lcm_create(NULL);
     if (!lcm) {
-        std::cerr << "Error: LCM initialization failed!" << std::endl;
+        std::cerr << "Failed to create LCM instance" << std::endl;
         return -1;
     }
     
-    // Subscribe to the Vicon state channel
-    lcm_subscribe(lcm, channel.c_str(), handle_vicon_state, NULL);
+    std::cout << "Starting Vicon State & Twist Receiver..." << std::endl;
+    std::cout << "Listening on channels: VICON_STATE, VICON_TWIST" << std::endl;
     
-    // Main loop
+    lcm_subscribe(lcm, "VICON_STATE", handle_vicon_state, NULL);
+    lcm_subscribe(lcm, "VICON_TWIST", handle_vicon_twist, NULL);
+    
     while (true) {
         lcm_handle(lcm);
-        usleep(10000); // 10ms
     }
     
     lcm_destroy(lcm);

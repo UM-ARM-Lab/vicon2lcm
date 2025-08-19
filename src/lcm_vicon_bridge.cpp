@@ -7,14 +7,16 @@
 #include <cstring>
 #include <algorithm>
 #include <cmath>
+#include <unordered_map>
 
 // Define M_PI if not defined
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
 
-// Include our custom LCM message
+// Include our custom LCM messages
 #include "../vicon_msgs/vicon_state_t.hpp"
+#include "../vicon_msgs/vicon_twist_t.hpp"
 
 class LCMViconBridge {
 private:
@@ -25,17 +27,33 @@ private:
     std::string stream_mode_;
     std::string tracker_name_;
 
+    struct PoseSample {
+        int64_t utime;
+        float position[3];
+        float quaternion[4]; // w, x, y, z
+    };
+    std::unordered_map<std::string, PoseSample> last_pose_by_segment_;
+    
+    // Twist message for all bodies
+    vicon_msgs::vicon_twist_t twist_msg_;
+    int twist_body_count_;
+
 public:
     LCMViconBridge(const std::string& host, const std::string& port,
                    const std::string& channel, const std::string& mode)
         : tracker_hostname_(host), tracker_port_(port), lcm_channel_(channel),
-          stream_mode_(mode), tracker_name_("vicon_tracker") {
+          stream_mode_(mode), tracker_name_("vicon_tracker"), twist_body_count_(0) {
 
         // Initialize LCM
         lcm_ = lcm_create(NULL);
         if (!lcm_) {
             throw std::runtime_error("LCM initialization failed!");
         }
+        
+        // Initialize twist message
+        twist_msg_.tracker_name = tracker_name_;
+        twist_msg_.frame_id = "vicon_world";
+        twist_msg_.num_bodies = 0;
     }
 
     ~LCMViconBridge() {
@@ -118,6 +136,11 @@ public:
                     std::cout << "    WARNING: Latency compensation resulted in negative time, using current time" << std::endl;
                     frame_time_us = current_time_us;
                 }
+                
+                // Reset twist message for this frame
+                twist_msg_.utime = frame_time_us;
+                twist_msg_.num_bodies = 0;
+                twist_body_count_ = 0;
                 
                 state_msg.utime = frame_time_us;
                 
@@ -214,6 +237,11 @@ public:
                                       << state_msg.rpy[valid_bodies][1] * 180.0 / M_PI << "°, " 
                                       << state_msg.rpy[valid_bodies][2] * 180.0 / M_PI << "°]" << std::endl;
 
+                            // Compute and add twist for this body
+                            compute_twist_for_body(object_name, segment_name, frame_time_us,
+                                                   state_msg.positions[valid_bodies],
+                                                   state_msg.quaternions[valid_bodies]);
+
                             valid_bodies++;
                         } else {
                             std::cout << "    No valid data for this segment" << std::endl;
@@ -227,7 +255,14 @@ public:
                 // Publish the complete state message
                 std::cout << "Publishing message with " << state_msg.num_bodies << " bodies" << std::endl;
                 publishState(state_msg);
-                std::cout << "Message published successfully!" << std::endl;
+                
+                // Publish the twist message
+                if (twist_msg_.num_bodies > 0) {
+                    std::cout << "Publishing twist message with " << twist_msg_.num_bodies << " bodies" << std::endl;
+                    publishTwist(twist_msg_);
+                }
+                
+                std::cout << "Messages published successfully!" << std::endl;
 
                 // Print status every 100 frames to avoid spam
                 if (frame_count % 100 == 0) {
@@ -257,6 +292,149 @@ public:
         std::vector<uint8_t> buffer(encoded_size);
         state_msg.encode(buffer.data(), 0, buffer.size());
         lcm_publish(lcm_, lcm_channel_.c_str(), buffer.data(), buffer.size());
+    }
+
+    void publishTwist(const vicon_msgs::vicon_twist_t& twist_msg) {
+        // Encode and publish twist message
+        const int encoded_size = twist_msg.getEncodedSize();
+        std::vector<uint8_t> buffer(encoded_size);
+        twist_msg.encode(buffer.data(), 0, buffer.size());
+        lcm_publish(lcm_, "VICON_TWIST", buffer.data(), buffer.size());
+    }
+
+    static std::string sanitize_for_channel(const std::string& input) {
+        std::string out;
+        out.reserve(input.size());
+        for (char c : input) {
+            char u = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            if ((u >= 'A' && u <= 'Z') || (u >= '0' && u <= '9') || u == '_') {
+                out.push_back(u);
+            } else {
+                out.push_back('_');
+            }
+        }
+        return out;
+    }
+
+    static void normalize_quaternion(float& w, float& x, float& y, float& z) {
+        double norm = std::sqrt(static_cast<double>(w)*w + static_cast<double>(x)*x + static_cast<double>(y)*y + static_cast<double>(z)*z);
+        if (norm > 0.0) {
+            w = static_cast<float>(w / norm);
+            x = static_cast<float>(x / norm);
+            y = static_cast<float>(y / norm);
+            z = static_cast<float>(z / norm);
+        }
+    }
+
+    static void quaternion_inverse(const float q[4], float q_inv[4]) {
+        // unit quaternion inverse is conjugate
+        q_inv[0] = q[0];
+        q_inv[1] = -q[1];
+        q_inv[2] = -q[2];
+        q_inv[3] = -q[3];
+    }
+
+    static void quaternion_multiply(const float a[4], const float b[4], float out[4]) {
+        // (w, x, y, z)
+        out[0] = a[0]*b[0] - a[1]*b[1] - a[2]*b[2] - a[3]*b[3];
+        out[1] = a[0]*b[1] + a[1]*b[0] + a[2]*b[3] - a[3]*b[2];
+        out[2] = a[0]*b[2] - a[1]*b[3] + a[2]*b[0] + a[3]*b[1];
+        out[3] = a[0]*b[3] + a[1]*b[2] - a[2]*b[1] + a[3]*b[0];
+    }
+
+    void compute_twist_for_body(const std::string& subject,
+                                const std::string& segment,
+                                int64_t utime,
+                                const float position_m[3],
+                                const float quaternion_wxyz[4]) {
+        // Build key per subject/segment
+        std::string key = subject + "/" + segment;
+        auto it = last_pose_by_segment_.find(key);
+        if (it == last_pose_by_segment_.end()) {
+            PoseSample sample;
+            sample.utime = utime;
+            sample.position[0] = position_m[0];
+            sample.position[1] = position_m[1];
+            sample.position[2] = position_m[2];
+            sample.quaternion[0] = quaternion_wxyz[0];
+            sample.quaternion[1] = quaternion_wxyz[1];
+            sample.quaternion[2] = quaternion_wxyz[2];
+            sample.quaternion[3] = quaternion_wxyz[3];
+            last_pose_by_segment_[key] = sample;
+            return; // need two samples for a velocity estimate
+        }
+
+        const PoseSample& prev = it->second;
+        const double dt = (utime - prev.utime) / 1e6; // seconds
+        if (dt <= 0.0) {
+            // Update stored sample and return
+            PoseSample sample;
+            sample.utime = utime;
+            sample.position[0] = position_m[0];
+            sample.position[1] = position_m[1];
+            sample.position[2] = position_m[2];
+            sample.quaternion[0] = quaternion_wxyz[0];
+            sample.quaternion[1] = quaternion_wxyz[1];
+            sample.quaternion[2] = quaternion_wxyz[2];
+            sample.quaternion[3] = quaternion_wxyz[3];
+            last_pose_by_segment_[key] = sample;
+            return;
+        }
+
+        // Linear velocity in world frame
+        float vx = static_cast<float>((position_m[0] - prev.position[0]) / dt);
+        float vy = static_cast<float>((position_m[1] - prev.position[1]) / dt);
+        float vz = static_cast<float>((position_m[2] - prev.position[2]) / dt);
+
+        // Angular velocity in world frame via quaternion delta
+        float q_prev[4] = { prev.quaternion[0], prev.quaternion[1], prev.quaternion[2], prev.quaternion[3] };
+        float q_curr[4] = { quaternion_wxyz[0], quaternion_wxyz[1], quaternion_wxyz[2], quaternion_wxyz[3] };
+        normalize_quaternion(q_prev[0], q_prev[1], q_prev[2], q_prev[3]);
+        normalize_quaternion(q_curr[0], q_curr[1], q_curr[2], q_curr[3]);
+
+        float q_prev_inv[4];
+        quaternion_inverse(q_prev, q_prev_inv);
+        float dq[4];
+        quaternion_multiply(q_prev_inv, q_curr, dq); // rotation from prev to curr
+        normalize_quaternion(dq[0], dq[1], dq[2], dq[3]);
+
+        // Convert dq to axis-angle
+        double angle = 2.0 * std::atan2(std::sqrt(static_cast<double>(dq[1])*dq[1] + static_cast<double>(dq[2])*dq[2] + static_cast<double>(dq[3])*dq[3]), std::max(-1.0f, std::min(1.0f, dq[0])));
+        double s = std::sqrt(static_cast<double>(dq[1])*dq[1] + static_cast<double>(dq[2])*dq[2] + static_cast<double>(dq[3])*dq[3]);
+        double ax = 0.0, ay = 0.0, az = 0.0;
+        if (s > 1e-9) {
+            ax = dq[1] / s;
+            ay = dq[2] / s;
+            az = dq[3] / s;
+        }
+        float wx = static_cast<float>((angle / dt) * ax);
+        float wy = static_cast<float>((angle / dt) * ay);
+        float wz = static_cast<float>((angle / dt) * az);
+
+        // Add to twist message array
+        if (twist_body_count_ < 10) {
+            twist_msg_.body_names[twist_body_count_] = subject;  // Use subject name only
+            twist_msg_.vx[twist_body_count_] = vx;
+            twist_msg_.vy[twist_body_count_] = vy;
+            twist_msg_.vz[twist_body_count_] = vz;
+            twist_msg_.wx[twist_body_count_] = wx;
+            twist_msg_.wy[twist_body_count_] = wy;
+            twist_msg_.wz[twist_body_count_] = wz;
+            twist_body_count_++;
+            twist_msg_.num_bodies = twist_body_count_;
+        }
+
+        // Update stored sample
+        PoseSample sample;
+        sample.utime = utime;
+        sample.position[0] = position_m[0];
+        sample.position[1] = position_m[1];
+        sample.position[2] = position_m[2];
+        sample.quaternion[0] = quaternion_wxyz[0];
+        sample.quaternion[1] = quaternion_wxyz[1];
+        sample.quaternion[2] = quaternion_wxyz[2];
+        sample.quaternion[3] = quaternion_wxyz[3];
+        last_pose_by_segment_[key] = sample;
     }
 };
 

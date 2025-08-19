@@ -1,0 +1,21 @@
+package vicon_msgs;
+
+struct vicon_twist_t
+{
+    int64_t utime;
+    string tracker_name;
+    string frame_id;
+    
+    // Array of twist data for multiple bodies
+    string body_names[10];      // Names of tracked bodies
+    float vx[10];              // [body] linear velocity x (m/s)
+    float vy[10];              // [body] linear velocity y (m/s)
+    float vz[10];              // [body] linear velocity z (m/s)
+    float wx[10];              // [body] angular velocity x (rad/s)
+    float wy[10];              // [body] angular velocity y (rad/s)
+    float wz[10];              // [body] angular velocity z (rad/s)
+    
+    int32_t num_bodies;        // Number of active bodies (max 10)
+}
+
+

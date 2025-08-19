@@ -11,6 +11,22 @@ list(APPEND CMAKE_PREFIX_PATH "$ENV{HOME}/.local/lib/python3.10/site-packages/li
 # Find required packages
 find_package(lcm REQUIRED)
 find_package(PkgConfig REQUIRED)
+# Generate LCM headers from lcm_msgs
+file(GLOB LCM_MSG_FILES ${PROJECT_SOURCE_DIR}/lcm_msgs/*.lcm)
+if(LCM_MSG_FILES)
+    foreach(lcmfile ${LCM_MSG_FILES})
+        get_filename_component(lcmname ${lcmfile} NAME_WE)
+        add_custom_command(
+            OUTPUT ${PROJECT_SOURCE_DIR}/vicon_msgs/${lcmname}_t.hpp
+            COMMAND lcm-gen --cpp --cpp-std c++17 ${lcmfile}
+            WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}/vicon_msgs
+            DEPENDS ${lcmfile}
+            COMMENT "Generating LCM C++ type for ${lcmname}"
+        )
+        list(APPEND LCM_GENERATED_HEADERS ${PROJECT_SOURCE_DIR}/vicon_msgs/${lcmname}_t.hpp)
+    endforeach()
+    add_custom_target(lcm_types ALL DEPENDS ${LCM_GENERATED_HEADERS})
+endif()
 
 # Vicon SDK paths
 if(CMAKE_SIZEOF_VOID_P MATCHES "8")
@@ -49,9 +65,11 @@ endif()
 
 # LCM Vicon Bridge executable
 add_executable(lcm_vicon_bridge src/lcm_vicon_bridge.cpp)
+add_dependencies(lcm_vicon_bridge lcm_types)
 
-# Vicon State Receiver executable
+# Vicon State Receiver executable (now handles both state and twist)
 add_executable(vicon_state_receiver src/vicon_state_receiver.cpp)
+add_dependencies(vicon_state_receiver lcm_types)
 
 # Link libraries
 target_link_libraries(lcm_vicon_bridge
