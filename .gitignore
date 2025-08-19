@@ -11,3 +11,34 @@ tags
 
 *.json  # ignore all json files
 /.vscode/
+
+# Build artifacts
+build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.o
+*.so
+*.a
+*.exe
+lcm_vicon_bridge
+
+# IDE files
+.vscode/
+.idea/
+*.user
+*.suo
+*.sdf
+*.opensdf
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+vicon_test_main/

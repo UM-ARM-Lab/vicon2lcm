@@ -1,0 +1,17 @@
+package vicon_msgs;
+
+struct vicon_state_t
+{
+    int64_t utime;
+    string tracker_name;
+    string frame_id;            // Coordinate frame ID (like ROS2)
+    
+    // Array of rigid body data
+    string body_names[10];      // Names of tracked bodies
+    float positions[10][3];     // [body][x,y,z] positions in meters
+    float quaternions[10][4];   // [body][w,x,y,z] quaternions
+    float rpy[10][3];          // [body][roll,pitch,yaw] in radians
+    int8_t occluded[10];       // [body] occlusion status (0=visible, 1=occluded)
+    
+    int32_t num_bodies;        // Number of active bodies (max 10)
+}
