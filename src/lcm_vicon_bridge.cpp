@@ -14,9 +14,9 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-// Include our custom LCM messages
-#include "../vicon_msgs/vicon_state_t.hpp"
-#include "../vicon_msgs/vicon_twist_t.hpp"
+// Include our custom LCM messages (generated under package path vicon_msgs/)
+#include "../vicon_msgs/vicon_msgs/vicon_state_t.hpp"
+#include "../vicon_msgs/vicon_msgs/vicon_twist_t.hpp"
 
 class LCMViconBridge {
 private:
@@ -386,30 +386,25 @@ public:
         float vy = static_cast<float>((position_m[1] - prev.position[1]) / dt);
         float vz = static_cast<float>((position_m[2] - prev.position[2]) / dt);
 
-        // Angular velocity in world frame via quaternion delta
+        // Angular velocity in world frame using quaternion derivative method
+        // Based on: https://mariogc.com/post/angular-velocity-quaternions/
         float q_prev[4] = { prev.quaternion[0], prev.quaternion[1], prev.quaternion[2], prev.quaternion[3] };
         float q_curr[4] = { quaternion_wxyz[0], quaternion_wxyz[1], quaternion_wxyz[2], quaternion_wxyz[3] };
         normalize_quaternion(q_prev[0], q_prev[1], q_prev[2], q_prev[3]);
         normalize_quaternion(q_curr[0], q_curr[1], q_curr[2], q_curr[3]);
 
-        float q_prev_inv[4];
-        quaternion_inverse(q_prev, q_prev_inv);
-        float dq[4];
-        quaternion_multiply(q_prev_inv, q_curr, dq); // rotation from prev to curr
-        normalize_quaternion(dq[0], dq[1], dq[2], dq[3]);
-
-        // Convert dq to axis-angle
-        double angle = 2.0 * std::atan2(std::sqrt(static_cast<double>(dq[1])*dq[1] + static_cast<double>(dq[2])*dq[2] + static_cast<double>(dq[3])*dq[3]), std::max(-1.0f, std::min(1.0f, dq[0])));
-        double s = std::sqrt(static_cast<double>(dq[1])*dq[1] + static_cast<double>(dq[2])*dq[2] + static_cast<double>(dq[3])*dq[3]);
-        double ax = 0.0, ay = 0.0, az = 0.0;
-        if (s > 1e-9) {
-            ax = dq[1] / s;
-            ay = dq[2] / s;
-            az = dq[3] / s;
-        }
-        float wx = static_cast<float>((angle / dt) * ax);
-        float wy = static_cast<float>((angle / dt) * ay);
-        float wz = static_cast<float>((angle / dt) * az);
+        float wx = static_cast<float>((2.0 / dt) * (
+            q_prev[0] * q_curr[1] - q_prev[1] * q_curr[0] - 
+            q_prev[2] * q_curr[3] + q_prev[3] * q_curr[2]
+        ));
+        float wy = static_cast<float>((2.0 / dt) * (
+            q_prev[0] * q_curr[2] + q_prev[1] * q_curr[3] - 
+            q_prev[2] * q_curr[0] - q_prev[3] * q_curr[1]
+        ));
+        float wz = static_cast<float>((2.0 / dt) * (
+            q_prev[0] * q_curr[3] - q_prev[1] * q_curr[2] + 
+            q_prev[2] * q_curr[1] - q_prev[3] * q_curr[0]
+        ));
 
         // Add to twist message array
         if (twist_body_count_ < 10) {

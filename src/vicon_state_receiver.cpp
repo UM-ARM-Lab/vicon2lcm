@@ -1,7 +1,7 @@
 #include <iostream>
 #include <lcm/lcm.h>
-#include "../vicon_msgs/vicon_state_t.hpp"
-#include "../vicon_msgs/vicon_twist_t.hpp"
+#include "../vicon_msgs/vicon_msgs/vicon_state_t.hpp"
+#include "../vicon_msgs/vicon_msgs/vicon_twist_t.hpp"
 
 // Define M_PI if not defined
 #ifndef M_PI
