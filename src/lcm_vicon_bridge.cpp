@@ -8,7 +8,7 @@
 #include <algorithm>
 #include <cmath>
 #include <unordered_map>
-#include <vector>   // added
+#include <vector>
 
 // Define M_PI if not defined
 #ifndef M_PI
@@ -29,6 +29,7 @@ private:
     std::string tracker_name_;
     float filter_alpha_;   // fallback smoothing factor (0..1)
     float filter_tau_s_;   // time-constant for EMA (sec). If >0, overrides alpha.
+
 
     struct PoseSample {
         int64_t utime;
@@ -79,13 +80,25 @@ private:
         out[0] = res[1]; out[1] = res[2]; out[2] = res[3];
     }
 
+    // rotate by q^{-1} (i.e., world->body if q maps body->world)
+    static void quat_rotate_vec_inv(const float q[4], const float v[3], float out[3]) {
+        float qinv[4]; quaternion_inverse(q, qinv);
+        quat_rotate_vec(qinv, v, out);
+    }
+
 public:
+    // Velocity frame selector
+    enum class VelFrame { WORLD, BODY };
+    VelFrame vel_frame_ = VelFrame::BODY;  // default
+    std::string twist_channel_;             // "VICON_TWIST_WORLD" or "VICON_TWIST_BODY"
+
     LCMViconBridge(const std::string& host, const std::string& port,
                    const std::string& channel, const std::string& mode,
-                   float alpha, float tau_s)
+                   float alpha, float tau_s, VelFrame vel_frame)
         : tracker_hostname_(host), tracker_port_(port), lcm_channel_(channel),
           stream_mode_(mode), tracker_name_("vicon_tracker"),
-          filter_alpha_(alpha), filter_tau_s_(tau_s), twist_body_count_(0) {
+          filter_alpha_(alpha), filter_tau_s_(tau_s), vel_frame_(vel_frame),
+          twist_body_count_(0) {
 
         // Initialize LCM
         lcm_ = lcm_create(NULL);
@@ -95,8 +108,10 @@ public:
         
         // Initialize twist message
         twist_msg_.tracker_name = tracker_name_;
-        twist_msg_.frame_id = "vicon_world";
+        twist_msg_.frame_id = (vel_frame_ == VelFrame::BODY) ? "vicon_body" : "vicon_world";
         twist_msg_.num_bodies = 0;
+
+        twist_channel_ = (vel_frame_ == VelFrame::BODY) ? "VICON_TWIST_BODY" : "VICON_TWIST_WORLD";
     }
 
     ~LCMViconBridge() {
@@ -107,10 +122,12 @@ public:
         std::cout << "Starting MBot LCM Vicon Bridge..." << std::endl;
         std::cout << "Configuration:" << std::endl;
         std::cout << "  Vicon Server: " << tracker_hostname_ << ":" << tracker_port_ << std::endl;
-        std::cout << "  LCM Channel: " << lcm_channel_ << std::endl;
+        std::cout << "  LCM State Channel: " << lcm_channel_ << std::endl;
+        std::cout << "  Twist Channel: " << twist_channel_ << std::endl;
         std::cout << "  Stream Mode: " << stream_mode_ << std::endl;
         std::cout << "  Message Type: vicon_state_t (multiple bodies)" << std::endl;
         std::cout << "  Rate: Maximum (no artificial delays)" << std::endl;
+        std::cout << "  Velocity frame: " << ((vel_frame_ == VelFrame::BODY) ? "BODY" : "WORLD") << std::endl;
 
         // Assemble the full hostname
         std::string full_hostname = tracker_hostname_ + ":" + tracker_port_;
@@ -159,7 +176,6 @@ public:
             auto frame_result = sdk_client.GetFrame();
             if (frame_result.Result == ViconDataStreamSDK::CPP::Result::Success) {
                 frame_count++;
-                // std::cout << "Frame " << frame_count << " received successfully!" << std::endl;
                 
                 // Create state message for all tracked objects
                 vicon_msgs::vicon_state_t state_msg;
@@ -171,7 +187,7 @@ public:
                 
                 // Get Vicon latency and compensate (like ROS2)
                 const double total_latency = sdk_client.GetLatencyTotal().Total;
-                int64_t latency_us = static_cast<int64_t>(total_latency * 1000000.0); // Convert seconds to microseconds
+                int64_t latency_us = static_cast<int64_t>(total_latency * 1000000.0); // seconds -> µs
                 
                 // Apply latency compensation
                 int64_t frame_time_us = current_time_us - latency_us;
@@ -298,7 +314,8 @@ public:
         const int encoded_size = twist_msg.getEncodedSize();
         std::vector<uint8_t> buffer(encoded_size);
         twist_msg.encode(buffer.data(), 0, buffer.size());
-        lcm_publish(lcm_, "VICON_TWIST", buffer.data(), buffer.size());
+        // Publish to frame-specific channel
+        lcm_publish(lcm_, twist_channel_.c_str(), buffer.data(), buffer.size());
     }
 
     static std::string sanitize_for_channel(const std::string& input) {
@@ -354,10 +371,12 @@ public:
             return;
         }
 
-        // Linear velocity in world frame
-        float vx = static_cast<float>((position_m[0] - prev.position[0]) / dt);
-        float vy = static_cast<float>((position_m[1] - prev.position[1]) / dt);
-        float vz = static_cast<float>((position_m[2] - prev.position[2]) / dt);
+        // Linear velocity in world frame (finite difference)
+        float v_world[3] = {
+            static_cast<float>((position_m[0] - prev.position[0]) / dt),
+            static_cast<float>((position_m[1] - prev.position[1]) / dt),
+            static_cast<float>((position_m[2] - prev.position[2]) / dt)
+        };
 
         // ---- Angular velocity via relative quaternion log ----
         // Enforce hemisphere continuity to avoid sign flips
@@ -387,20 +406,12 @@ public:
             axis_d[0] = dq[1]/n; axis_d[1] = dq[2]/n; axis_d[2] = dq[3]/n;
         }
 
-        // Body-frame angular velocity
+        // Body-frame angular velocity (from relative rotation)
         float w_body[3] = {
             (float)((theta / dt) * axis_d[0]),
             (float)((theta / dt) * axis_d[1]),
             (float)((theta / dt) * axis_d[2])
         };
-
-        // Convert to world-frame angular velocity to match linear velocity (optional)
-        // float w_world[3];
-        // quat_rotate_vec(q_prev, w_body, w_world);
-
-        // float wx_raw = w_world[0];
-        // float wy_raw = w_world[1];
-        // float wz_raw = w_world[2];
 
         // ---- Dirty derivative / EMA with time-constant ----
         static std::unordered_map<std::string, float> filt_wx, filt_wy, filt_wz;
@@ -419,17 +430,34 @@ public:
             filt_wz[key] += alpha * (w_body[2] - filt_wz[key]);
         }
 
-        float wx = filt_wx[key], wy = filt_wy[key], wz = filt_wz[key];
+        float wx_b = filt_wx[key], wy_b = filt_wy[key], wz_b = filt_wz[key];
+
+        // ----- Express velocities in requested frame -----
+        float v_out[3];
+        float w_out[3];
+
+        if (vel_frame_ == VelFrame::BODY) {
+            // Linear: v_b = R(q_prev)^T v_w
+            quat_rotate_vec_inv(q_prev, v_world, v_out);
+            // Angular already in body (w_body)
+            w_out[0] = wx_b; w_out[1] = wy_b; w_out[2] = wz_b;
+        } else {
+            // WORLD frame: linear already in world
+            v_out[0] = v_world[0]; v_out[1] = v_world[1]; v_out[2] = v_world[2];
+            // Angular: w_w = R(q_prev) w_b
+            float w_tmp[3] = {wx_b, wy_b, wz_b};
+            quat_rotate_vec(q_prev, w_tmp, w_out);
+        }
 
         // Add to twist message array
         if (twist_body_count_ < 10) {
             twist_msg_.body_names[twist_body_count_] = subject;  // Use subject name only
-            twist_msg_.vx[twist_body_count_] = vx;
-            twist_msg_.vy[twist_body_count_] = vy;
-            twist_msg_.vz[twist_body_count_] = vz;
-            twist_msg_.wx[twist_body_count_] = wx;
-            twist_msg_.wy[twist_body_count_] = wy;
-            twist_msg_.wz[twist_body_count_] = wz;
+            twist_msg_.vx[twist_body_count_] = v_out[0];
+            twist_msg_.vy[twist_body_count_] = v_out[1];
+            twist_msg_.vz[twist_body_count_] = v_out[2];
+            twist_msg_.wx[twist_body_count_] = w_out[0];
+            twist_msg_.wy[twist_body_count_] = w_out[1];
+            twist_msg_.wz[twist_body_count_] = w_out[2];
             twist_body_count_++;
             twist_msg_.num_bodies = twist_body_count_;
         }
@@ -455,6 +483,7 @@ int main(int argc, char** argv) {
     std::string stream_mode = "ServerPush";
     float filter_alpha = 0.3f;   // fallback EMA coefficient
     float filter_tau_s  = 0.05f; // if >0, use τ-based EMA (recommended)
+    std::string vel_frame_cli = "body";  // default: body (linear/body, angular/body)
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -470,23 +499,32 @@ int main(int argc, char** argv) {
             filter_alpha = std::stof(argv[++i]);
         } else if (arg == "--tau" && i + 1 < argc) {
             filter_tau_s = std::stof(argv[++i]); // e.g., 0.03 (≈5.3 Hz cutoff)
+        } else if (arg == "--vel-frame" && i + 1 < argc) {
+            vel_frame_cli = argv[++i]; // "world" or "body"
         } else if (arg == "--help") {
             std::cout << "Usage: " << argv[0] << " [options]\n"
                       << "Options:\n"
-                      << "  --host HOST     Vicon server hostname (default: 10.10.10.5)\n"
-                      << "  --port PORT     Vicon server port (default: 801)\n"
-                      << "  --channel CH    LCM channel name (default: VICON_STATE)\n"
-                      << "  --mode MODE     Streaming mode: ServerPush/ClientPull/ClientPullPreFetch (default: ServerPush)\n"
-                      << "  --alpha ALPHA   EMA coefficient (0..1). Used if --tau not set (default: 0.3)\n"
-                      << "  --tau   TAU_S   EMA time-constant in seconds (recommended; overrides --alpha)\n"
-                      << "  --help          Show this help message\n";
+                      << "  --host HOST       Vicon server hostname (default: 10.10.10.5)\n"
+                      << "  --port PORT       Vicon server port (default: 801)\n"
+                      << "  --channel CH      LCM state channel name (default: VICON_STATE)\n"
+                      << "  --mode MODE       Streaming mode: ServerPush|ClientPull|ClientPullPreFetch (default: ServerPush)\n"
+                      << "  --alpha ALPHA     EMA coefficient (0..1). Used if --tau not set (default: 0.3)\n"
+                      << "  --tau   TAU_S     EMA time-constant in seconds (recommended; overrides --alpha)\n"
+                      << "  --vel-frame F     Velocity frame for BOTH linear and angular: world|body (default: body)\n"
+                      << "                    Publishes to VICON_TWIST_WORLD or VICON_TWIST_BODY accordingly.\n"
+                      << "  --help            Show this help message\n";
             return 0;
         }
     }
 
+    // Map CLI to enum
+    LCMViconBridge::VelFrame vel_frame =
+        (vel_frame_cli == "body") ? LCMViconBridge::VelFrame::BODY
+                                  : LCMViconBridge::VelFrame::WORLD;
+
     try {
         LCMViconBridge bridge(tracker_hostname, tracker_port, lcm_channel, stream_mode,
-                              filter_alpha, filter_tau_s);
+                      filter_alpha, filter_tau_s, vel_frame);
         bridge.run();
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
