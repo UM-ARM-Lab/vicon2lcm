@@ -100,8 +100,8 @@ public:
           filter_alpha_(alpha), filter_tau_s_(tau_s), vel_frame_(vel_frame),
           twist_body_count_(0) {
 
-        // Initialize LCM
-        lcm_ = lcm_create(NULL);
+        // Initialize LCM with TTL=0 (no network transmission)
+        lcm_ = lcm_create("udpm://?ttl=0");
         if (!lcm_) {
             throw std::runtime_error("LCM initialization failed!");
         }

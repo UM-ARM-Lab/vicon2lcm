@@ -57,7 +57,7 @@ void handle_vicon_twist(const lcm_recv_buf_t* rbuf, const char* channel, void* u
 }
 
 int main() {
-    lcm_t* lcm = lcm_create(NULL);
+    lcm_t* lcm = lcm_create("udpm://?ttl=0");
     if (!lcm) {
         std::cerr << "Failed to create LCM instance" << std::endl;
         return -1;
