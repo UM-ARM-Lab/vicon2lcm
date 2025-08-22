@@ -26,6 +26,7 @@ private:
     std::string tracker_port_;
     std::string stream_mode_;
     std::string tracker_name_;
+    float filter_alpha_; // Filter coefficient for dirty derivative
 
     struct PoseSample {
         int64_t utime;
@@ -40,9 +41,9 @@ private:
 
 public:
     LCMViconBridge(const std::string& host, const std::string& port,
-                   const std::string& channel, const std::string& mode)
+                   const std::string& channel, const std::string& mode, float alpha)
         : tracker_hostname_(host), tracker_port_(port), lcm_channel_(channel),
-          stream_mode_(mode), tracker_name_("vicon_tracker"), twist_body_count_(0) {
+          stream_mode_(mode), tracker_name_("vicon_tracker"), twist_body_count_(0), filter_alpha_(alpha) {
 
         // Initialize LCM
         lcm_ = lcm_create(NULL);
@@ -393,18 +394,36 @@ public:
         normalize_quaternion(q_prev[0], q_prev[1], q_prev[2], q_prev[3]);
         normalize_quaternion(q_curr[0], q_curr[1], q_curr[2], q_curr[3]);
 
-        float wx = static_cast<float>((2.0 / dt) * (
+        // Raw angular velocity estimates (noisy)
+        float wx_raw = static_cast<float>((2.0 / dt) * (
             q_prev[0] * q_curr[1] - q_prev[1] * q_curr[0] - 
             q_prev[2] * q_curr[3] + q_prev[3] * q_curr[2]
         ));
-        float wy = static_cast<float>((2.0 / dt) * (
+        float wy_raw = static_cast<float>((2.0 / dt) * (
             q_prev[0] * q_curr[2] + q_prev[1] * q_curr[3] - 
             q_prev[2] * q_curr[0] - q_prev[3] * q_curr[1]
         ));
-        float wz = static_cast<float>((2.0 / dt) * (
+        float wz_raw = static_cast<float>((2.0 / dt) * (
             q_prev[0] * q_curr[3] - q_prev[1] * q_curr[2] + 
             q_prev[2] * q_curr[1] - q_prev[3] * q_curr[0]
         ));
+
+        // Dirty derivative: Low-pass filter to reduce noise
+        // Each tracked object has its own filter state
+        static std::unordered_map<std::string, float> prev_wx, prev_wy, prev_wz;
+        
+        // Use the configurable filter coefficient for dirty derivative
+        // filter_alpha_ is set via command line argument
+        
+        // Apply low-pass filter: filtered = α*current + (1-α)*previous
+        float wx = filter_alpha_ * wx_raw + (1.0f - filter_alpha_) * prev_wx[key];
+        float wy = filter_alpha_ * wy_raw + (1.0f - filter_alpha_) * prev_wy[key];
+        float wz = filter_alpha_ * wz_raw + (1.0f - filter_alpha_) * prev_wz[key];
+        
+        // Store filtered values for next iteration
+        prev_wx[key] = wx;
+        prev_wy[key] = wy;
+        prev_wz[key] = wz;
 
         // Add to twist message array
         if (twist_body_count_ < 10) {
@@ -438,6 +457,7 @@ int main(int argc, char** argv) {
     std::string tracker_port = "801";
     std::string lcm_channel = "VICON_STATE";
     std::string stream_mode = "ServerPush";
+    float filter_alpha = 0.3f; // Default filter coefficient for dirty derivative
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -449,6 +469,8 @@ int main(int argc, char** argv) {
             lcm_channel = argv[++i];
         } else if (arg == "--mode" && i + 1 < argc) {
             stream_mode = argv[++i];
+        } else if (arg == "--alpha" && i + 1 < argc) {
+            filter_alpha = std::stof(argv[++i]);
         } else if (arg == "--help") {
             std::cout << "Usage: " << argv[0] << " [options]" << std::endl;
             std::cout << "Options:" << std::endl;
@@ -456,13 +478,14 @@ int main(int argc, char** argv) {
             std::cout << "  --port PORT     Vicon server port (default: 801)" << std::endl;
             std::cout << "  --channel CH    LCM channel name (default: VICON_STATE)" << std::endl;
             std::cout << "  --mode MODE     Streaming mode: ServerPush/ClientPull/ClientPullPreFetch (default: ServerPush)" << std::endl;
+            std::cout << "  --alpha ALPHA   Filter coefficient for dirty derivative (0.1-0.9, default: 0.3)" << std::endl;
             std::cout << "  --help          Show this help message" << std::endl;
             return 0;
         }
     }
 
     try {
-        LCMViconBridge bridge(tracker_hostname, tracker_port, lcm_channel, stream_mode);
+        LCMViconBridge bridge(tracker_hostname, tracker_port, lcm_channel, stream_mode, filter_alpha);
         bridge.run();
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
