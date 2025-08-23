@@ -4,8 +4,6 @@
 #include <lcm/lcm.h>
 #include <Client.h>
 #include <unistd.h>
-#include <cstring>
-#include <algorithm>
 #include <cmath>
 #include <unordered_map>
 #include <vector>
@@ -27,8 +25,8 @@ private:
     std::string tracker_port_;
     std::string stream_mode_;
     std::string tracker_name_;
-    float filter_alpha_;   // fallback smoothing factor (0..1)
     float filter_tau_s_;   // time-constant for EMA (sec). If >0, overrides alpha.
+    int64_t max_frame_count_;      // Reset frame counter every N frames
 
 
     struct PoseSample {
@@ -94,11 +92,12 @@ public:
 
     LCMViconBridge(const std::string& host, const std::string& port,
                    const std::string& channel, const std::string& mode,
-                   float alpha, float tau_s, VelFrame vel_frame)
+                   float tau_s, VelFrame vel_frame,
+                   int64_t max_frames)
         : tracker_hostname_(host), tracker_port_(port), lcm_channel_(channel),
           stream_mode_(mode), tracker_name_("vicon_tracker"),
-          filter_alpha_(alpha), filter_tau_s_(tau_s), vel_frame_(vel_frame),
-          twist_body_count_(0) {
+          filter_tau_s_(tau_s), vel_frame_(vel_frame),
+          twist_body_count_(0), max_frame_count_(max_frames) {
 
         // Initialize LCM with TTL=0 (no network transmission)
         lcm_ = lcm_create("udpm://?ttl=0");
@@ -171,11 +170,23 @@ public:
 
         std::cout << "Streaming data..." << std::endl;
 
-        int frame_count = 0;
+        int64_t frame_count = 0;
+        
+        // Print initial status line
+        std::cout << "=== VICON BRIDGE ACTIVE ===" << std::endl;
+        
         while (true) {
             auto frame_result = sdk_client.GetFrame();
             if (frame_result.Result == ViconDataStreamSDK::CPP::Result::Success) {
                 frame_count++;
+                
+                // Prevent frame counter overflow - with int64_t this is extremely unlikely but safe
+                if (frame_count >= max_frame_count_) {
+                    std::cout << "\n=== RESETTING FRAME COUNTER ===" << std::endl;
+                    std::cout << "Reset at: " << frame_count << " frames" << std::endl;
+                    frame_count = 0;
+                    std::cout << "=== VICON BRIDGE ACTIVE ===" << std::endl;
+                }
                 
                 // Create state message for all tracked objects
                 vicon_msgs::vicon_state_t state_msg;
@@ -203,6 +214,7 @@ public:
                 
                 state_msg.utime = frame_time_us;
                 state_msg.tracker_name = tracker_name_;
+                state_msg.frame_id = "vicon_world"; // Coordinate frame identifier (not the frame counter)
 
                 const unsigned int objects = sdk_client.GetSubjectCount().SubjectCount;
                 int valid_bodies = 0;
@@ -276,16 +288,15 @@ public:
                 // Set the actual number of valid bodies we found
                 state_msg.num_bodies = valid_bodies;
 
+                // Update status line every 200 frames to reduce output frequency
+                if (frame_count % 200 == 0) {
+                    std::cout << "\rFrame: " << frame_count << "+ | Bodies: " << state_msg.num_bodies << " | Status: ACTIVE" << std::flush;
+                }
+
                 // Publish state and twist
                 publishState(state_msg);
                 if (twist_msg_.num_bodies > 0) {
                     publishTwist(twist_msg_);
-                }
-
-                // Optional logging every 100 frames
-                if (frame_count % 100 == 0) {
-                    std::cout << "Published frame " << frame_count
-                              << " with " << state_msg.num_bodies << " tracked bodies" << std::endl;
                 }
                 
             } else {
@@ -304,32 +315,28 @@ public:
     void publishState(const vicon_msgs::vicon_state_t& state_msg) {
         // Encode and publish
         const int encoded_size = state_msg.getEncodedSize();
-        std::vector<uint8_t> buffer(encoded_size);
-        state_msg.encode(buffer.data(), 0, buffer.size());
-        lcm_publish(lcm_, lcm_channel_.c_str(), buffer.data(), buffer.size());
+        // Use fixed buffer size - LCM messages are typically small
+        uint8_t buffer[4096]; // 4KB should be sufficient for Vicon messages
+        if (encoded_size > 4096) {
+            std::cerr << "Warning: Message size " << encoded_size << " exceeds buffer size" << std::endl;
+            return;
+        }
+        state_msg.encode(buffer, 0, encoded_size);
+        lcm_publish(lcm_, lcm_channel_.c_str(), buffer, encoded_size);
     }
 
     void publishTwist(const vicon_msgs::vicon_twist_t& twist_msg) {
         // Encode and publish twist message
         const int encoded_size = twist_msg.getEncodedSize();
-        std::vector<uint8_t> buffer(encoded_size);
-        twist_msg.encode(buffer.data(), 0, buffer.size());
-        // Publish to frame-specific channel
-        lcm_publish(lcm_, twist_channel_.c_str(), buffer.data(), buffer.size());
-    }
-
-    static std::string sanitize_for_channel(const std::string& input) {
-        std::string out;
-        out.reserve(input.size());
-        for (char c : input) {
-            char u = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-            if ((u >= 'A' && u <= 'Z') || (u >= '0' && u <= '9') || u == '_') {
-                out.push_back(u);
-            } else {
-                out.push_back('_');
-            }
+        // Use fixed buffer size - LCM messages are typically small
+        uint8_t buffer[4096]; // 4KB should be sufficient for Vicon messages
+        if (encoded_size > 4096) {
+            std::cerr << "Warning: Message size " << encoded_size << " exceeds buffer size" << std::endl;
+            return;
         }
-        return out;
+        twist_msg.encode(buffer, 0, encoded_size);
+        // Publish to frame-specific channel
+        lcm_publish(lcm_, twist_channel_.c_str(), buffer, encoded_size);
     }
 
     void compute_twist_for_body(const std::string& subject,
@@ -418,7 +425,7 @@ public:
         static std::unordered_map<std::string, bool>   filt_init;
 
         // If tau>0, compute per-sample alpha = dt / (tau + dt). Otherwise use fixed filter_alpha_
-        float alpha = (filter_tau_s_ > 0.0f) ? (float)(dt / (filter_tau_s_ + dt)) : filter_alpha_;
+        float alpha = (filter_tau_s_ > 0.0f) ? (float)(dt / (filter_tau_s_ + dt)) : 0.3f; // Fallback to 0.3
         alpha = std::min(1.0f, std::max(0.0f, alpha));
 
         if (!filt_init[key]) {
@@ -481,9 +488,9 @@ int main(int argc, char** argv) {
     std::string tracker_port = "801";
     std::string lcm_channel = "VICON_STATE";
     std::string stream_mode = "ServerPush";
-    float filter_alpha = 0.3f;   // fallback EMA coefficient
     float filter_tau_s  = 0.05f; // if >0, use τ-based EMA (recommended)
     std::string vel_frame_cli = "body";  // default: body (linear/body, angular/body)
+    int64_t max_frame_count = 1000000000; // Reset frame counter every N frames
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -495,12 +502,12 @@ int main(int argc, char** argv) {
             lcm_channel = argv[++i];
         } else if (arg == "--mode" && i + 1 < argc) {
             stream_mode = argv[++i];
-        } else if (arg == "--alpha" && i + 1 < argc) {
-            filter_alpha = std::stof(argv[++i]);
         } else if (arg == "--tau" && i + 1 < argc) {
             filter_tau_s = std::stof(argv[++i]); // e.g., 0.03 (≈5.3 Hz cutoff)
         } else if (arg == "--vel-frame" && i + 1 < argc) {
             vel_frame_cli = argv[++i]; // "world" or "body"
+        } else if (arg == "--max-frames" && i + 1 < argc) {
+            max_frame_count = std::stoll(argv[++i]); // Reset frame counter every N frames
         } else if (arg == "--help") {
             std::cout << "Usage: " << argv[0] << " [options]\n"
                       << "Options:\n"
@@ -508,10 +515,10 @@ int main(int argc, char** argv) {
                       << "  --port PORT       Vicon server port (default: 801)\n"
                       << "  --channel CH      LCM state channel name (default: VICON_STATE)\n"
                       << "  --mode MODE       Streaming mode: ServerPush|ClientPull|ClientPullPreFetch (default: ServerPush)\n"
-                      << "  --alpha ALPHA     EMA coefficient (0..1). Used if --tau not set (default: 0.3)\n"
-                      << "  --tau   TAU_S     EMA time-constant in seconds (recommended; overrides --alpha)\n"
+                      << "  --tau   TAU_S     EMA time-constant in seconds (recommended)\n"
                       << "  --vel-frame F     Velocity frame for BOTH linear and angular: world|body (default: body)\n"
                       << "                    Publishes to VICON_TWIST_WORLD or VICON_TWIST_BODY accordingly.\n"
+                      << "  --max-frames N    Reset frame counter every N frames (default: 1000000000)\n"
                       << "  --help            Show this help message\n";
             return 0;
         }
@@ -524,7 +531,8 @@ int main(int argc, char** argv) {
 
     try {
         LCMViconBridge bridge(tracker_hostname, tracker_port, lcm_channel, stream_mode,
-                      filter_alpha, filter_tau_s, vel_frame);
+                      filter_tau_s, vel_frame,
+                      max_frame_count);
         bridge.run();
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;

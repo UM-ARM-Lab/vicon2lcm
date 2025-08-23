@@ -65,12 +65,19 @@ int main() {
     
     std::cout << "Starting Vicon State & Twist Receiver..." << std::endl;
     std::cout << "Listening on channels: VICON_STATE, VICON_TWIST" << std::endl;
+    std::cout << "=== VICON RECEIVER ACTIVE ===" << std::endl;
     
     lcm_subscribe(lcm, "VICON_STATE", handle_vicon_state, NULL);
     lcm_subscribe(lcm, "VICON_TWIST", handle_vicon_twist, NULL);
     
+    int message_count = 0;
+    
     while (true) {
         lcm_handle(lcm);
+        message_count++;
+        
+        // Update status line in place
+        std::cout << "\rMessages: " << message_count << " | Status: LISTENING" << std::flush;
     }
     
     lcm_destroy(lcm);
