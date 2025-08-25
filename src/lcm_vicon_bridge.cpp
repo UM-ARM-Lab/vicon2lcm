@@ -99,8 +99,8 @@ public:
           filter_tau_s_(tau_s), vel_frame_(vel_frame),
           twist_body_count_(0), max_frame_count_(max_frames) {
 
-        // Initialize LCM with TTL=0 (no network transmission)
-        lcm_ = lcm_create("udpm://?ttl=0");
+        // Initialize LCM with TTL=1 for network transmission to robot
+        lcm_ = lcm_create("udpm://239.255.76.67:7667?ttl=1");
         if (!lcm_) {
             throw std::runtime_error("LCM initialization failed!");
         }
